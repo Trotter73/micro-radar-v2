@@ -143,6 +143,23 @@ void AircraftManager::NetworkTaskFunc(void* param)
     while (true) {
         vTaskDelay(pdMS_TO_TICKS(self->fetchInterval));
 
+        // ESP32-C3's plain Arduino framework build doesn't expose a way to
+        // shrink mbedTLS's per-connection buffers, so heap fragmentation
+        // from repeated HTTPS handshakes is unavoidable over time. Rather
+        // than let a handshake crash mid-call unpredictably once things
+        // get bad (as happened before), proactively restart here - a safe
+        // point with no request in flight - once the largest allocatable
+        // block gets too small to trust for even the main fetch.
+        constexpr uint32_t CRITICAL_LARGEST_BLOCK = 32000;
+        uint32_t largestBlockAtCycleStart = ESP.getMaxAllocHeap();
+        if (largestBlockAtCycleStart < CRITICAL_LARGEST_BLOCK) {
+            Serial.print("[NET] largest block critically low (");
+            Serial.print(largestBlockAtCycleStart);
+            Serial.println("), restarting for a clean heap");
+            delay(100);  // let the serial line flush before reboot
+            ESP.restart();
+        }
+
         // auth
         const String token = self->authHandler.GetValidToken(
             self->openskyId,
@@ -179,6 +196,9 @@ void AircraftManager::NetworkTaskFunc(void* param)
         Serial.println(ESP.getFreeHeap());
 
         auto aircraft = JsonParser::ParseArray<Aircraft>(doc["states"]);
+        doc.clear();  // free the parsed states/all document now - it's not
+                       // needed anymore, and route fetches below need all
+                       // the contiguous heap they can get
         unsigned long now = millis();
 
         Serial.print("[NET] OK, planes: ");
@@ -214,24 +234,34 @@ void AircraftManager::NetworkTaskFunc(void* param)
         }
 
         // fetch one route per plane that needs it (capped per cycle, and
-        // heap-gated, to limit back-to-back TLS handshakes which are the
-        // biggest single heap cost on ESP32-C3)
-        // TEMPORARILY DISABLED: route lookups were causing reboots even
-        // gated to 1-per-cycle. Flip to true once the underlying TLS/heap
-        // issue is resolved.
+        // gated on the largest allocatable block rather than total free
+        // heap - a TLS handshake needs one big contiguous chunk, and on a
+        // fragmented heap total-free can look healthy while no single
+        // block is big enough, which is what was crashing this)
+        //
+        // DISABLED: with an already-busy area, this rarely got enough
+        // contiguous heap to fire anyway, while still contributing to
+        // fragmentation on the cycles it did run. Not worth the cost for
+        // the value it was actually delivering. Flip back to true to
+        // re-enable if useful later (e.g. quieter areas, or after a real
+        // fix for the underlying TLS memory footprint).
         constexpr bool ENABLE_ROUTE_FETCHING = false;
         constexpr unsigned long RETRY_INTERVAL = 300000;
         constexpr int MAX_ROUTE_FETCHES_PER_CYCLE = 1;
-        constexpr uint32_t MIN_HEAP_FOR_ROUTE_FETCH = 45000;
+        constexpr uint32_t MIN_LARGEST_BLOCK_FOR_ROUTE_FETCH = 30000;
         int routeFetchesThisCycle = 0;
         for (auto& [icao, tracked] : localAircraft) {
             if (!ENABLE_ROUTE_FETCHING) break;
             if (routeFetchesThisCycle >= MAX_ROUTE_FETCHES_PER_CYCLE) break;
 
             uint32_t heapBefore = ESP.getFreeHeap();
-            if (heapBefore < MIN_HEAP_FOR_ROUTE_FETCH) {
-                Serial.print("[NET] skipping route fetch, heap too low: ");
-                Serial.println(heapBefore);
+            uint32_t largestBlock = ESP.getMaxAllocHeap();
+            if (largestBlock < MIN_LARGEST_BLOCK_FOR_ROUTE_FETCH) {
+                Serial.print("[NET] skipping route fetch, largest block too small: ");
+                Serial.print(largestBlock);
+                Serial.print(" (free heap: ");
+                Serial.print(heapBefore);
+                Serial.println(")");
                 break;
             }
 
@@ -252,7 +282,9 @@ void AircraftManager::NetworkTaskFunc(void* param)
             String url = "https://vrs-standing-data.adsb.lol/routes/" + prefix + "/" + callsign + ".json";
 
             Serial.print("[NET] attempting route fetch, free heap before: ");
-            Serial.println(heapBefore);
+            Serial.print(heapBefore);
+            Serial.print(", largest block: ");
+            Serial.println(ESP.getMaxAllocHeap());
 
             HttpResult routeResult = self->http.Get(url, {}, {});
             routeFetchesThisCycle++;
