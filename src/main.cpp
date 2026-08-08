@@ -48,6 +48,12 @@ void setup()
   WiFiManagerHelpers::ConfigureWiFiManager(wm, tft);
   wm.autoConnect(WiFiManagerHelpers::WiFiManagerName);
 
+  // show allocated IP address briefly
+  tft.fillScreen(lgfx::color888(0, 0, 0));
+  tft.setTextColor(lgfx::color888(0, 255, 0));
+  tft.drawCentreString(WiFi.localIP().toString(), SCREEN_SIZE / 2, SCREEN_SIZE / 2);
+  delay(3000);
+
   // sync time via NTP — estimate timezone from longitude
   double cfgLon = configServer.GetStoredString("longitude").toDouble();
   int utcOffset = (int)round(cfgLon / 15.0) * 3600;

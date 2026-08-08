@@ -86,3 +86,48 @@ HttpResult HttpRequestManager::Post(const String& url, const String& body, const
     http.end();
     return result;
 }
+
+bool HttpRequestManager::GetJson(const String& url, JsonDocument& doc, int& statusCode, const std::vector<std::pair<String, String>>& params, const std::vector<std::pair<String, String>>& headers)
+{
+    const String queryParams = BuildQueryString(params);
+    const String fullUrl = url + queryParams;
+
+    http.begin(fullUrl);
+    http.useHTTP10(true);  // avoids chunked transfer encoding, so getStream() below
+                            // yields the raw JSON body ArduinoJson can parse directly
+
+    for (const auto& header : headers) {
+        http.addHeader(header.first, header.second);
+    }
+
+    statusCode = http.GET();
+
+    if (statusCode != 200) {
+        if (statusCode > 0) {
+            Serial.print("[GET] HTTP Error (");
+            Serial.print(statusCode);
+            Serial.println(")");
+        } else {
+            Serial.print("[GET] HTTP Error (");
+            Serial.print(statusCode);
+            Serial.print("): ");
+            Serial.println(http.errorToString(statusCode));
+        }
+        http.end();
+        return false;
+    }
+
+    // parse directly from the response stream instead of buffering the
+    // whole body into a String first - avoids holding two large copies
+    // of the payload in RAM at once
+    DeserializationError err = deserializeJson(doc, http.getStream());
+    http.end();
+
+    if (err) {
+        Serial.print("[GET] JSON parse error: ");
+        Serial.println(err.c_str());
+        return false;
+    }
+
+    return true;
+}

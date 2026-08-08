@@ -152,9 +152,14 @@ void AircraftManager::NetworkTaskFunc(void* param)
         std::vector<std::pair<String, String>> headers = {};
         if (!token.isEmpty()) headers.push_back({ "Authorization", "Bearer " + token });
 
-        // fetch aircraft
-        HttpResult result = self->http.Get(
+        // fetch aircraft - parsed directly from the response stream to avoid
+        // holding the full JSON text and the parsed doc in RAM simultaneously
+        JsonDocument doc;
+        int statusCode = 0;
+        bool ok = self->http.GetJson(
             "https://opensky-network.org/api/states/all",
+            doc,
+            statusCode,
             {
               {"lamin", String(self->lat - self->rad)},
               {"lamax", String(self->lat + self->rad)},
@@ -164,19 +169,22 @@ void AircraftManager::NetworkTaskFunc(void* param)
             headers
         );
 
-        if (!result.success || result.statusCode != 200) {
-            Serial.print("[NET] Fetch failed: ");
-            Serial.println(result.success ? String(result.statusCode) : result.errorMessage);
+        if (!ok) {
+            Serial.print("[NET] Fetch failed, status: ");
+            Serial.println(statusCode);
             continue;
         }
 
-        JsonDocument doc;
-        deserializeJson(doc, result.response);
+        Serial.print("[NET] free heap after fetch/parse: ");
+        Serial.println(ESP.getFreeHeap());
+
         auto aircraft = JsonParser::ParseArray<Aircraft>(doc["states"]);
         unsigned long now = millis();
 
         Serial.print("[NET] OK, planes: ");
-        Serial.println(aircraft.size());
+        Serial.print(aircraft.size());
+        Serial.print(", free heap: ");
+        Serial.println(ESP.getFreeHeap());
 
         // update local tracked aircraft
         for (auto& ac : aircraft) {
@@ -205,9 +213,28 @@ void AircraftManager::NetworkTaskFunc(void* param)
                 ++it;
         }
 
-        // fetch one route per plane that needs it
+        // fetch one route per plane that needs it (capped per cycle, and
+        // heap-gated, to limit back-to-back TLS handshakes which are the
+        // biggest single heap cost on ESP32-C3)
+        // TEMPORARILY DISABLED: route lookups were causing reboots even
+        // gated to 1-per-cycle. Flip to true once the underlying TLS/heap
+        // issue is resolved.
+        constexpr bool ENABLE_ROUTE_FETCHING = false;
         constexpr unsigned long RETRY_INTERVAL = 300000;
+        constexpr int MAX_ROUTE_FETCHES_PER_CYCLE = 1;
+        constexpr uint32_t MIN_HEAP_FOR_ROUTE_FETCH = 45000;
+        int routeFetchesThisCycle = 0;
         for (auto& [icao, tracked] : localAircraft) {
+            if (!ENABLE_ROUTE_FETCHING) break;
+            if (routeFetchesThisCycle >= MAX_ROUTE_FETCHES_PER_CYCLE) break;
+
+            uint32_t heapBefore = ESP.getFreeHeap();
+            if (heapBefore < MIN_HEAP_FOR_ROUTE_FETCH) {
+                Serial.print("[NET] skipping route fetch, heap too low: ");
+                Serial.println(heapBefore);
+                break;
+            }
+
             auto it = localRoutes.find(icao);
             if (it != localRoutes.end()) {
                 if (it->second.route.length() > 0) continue;
@@ -224,7 +251,13 @@ void AircraftManager::NetworkTaskFunc(void* param)
             String prefix = callsign.substring(0, 2);
             String url = "https://vrs-standing-data.adsb.lol/routes/" + prefix + "/" + callsign + ".json";
 
+            Serial.print("[NET] attempting route fetch, free heap before: ");
+            Serial.println(heapBefore);
+
             HttpResult routeResult = self->http.Get(url, {}, {});
+            routeFetchesThisCycle++;
+            Serial.print("[NET] route fetch done, free heap: ");
+            Serial.println(ESP.getFreeHeap());
 
             if (routeResult.success && routeResult.statusCode == 200) {
                 JsonDocument rdoc;
